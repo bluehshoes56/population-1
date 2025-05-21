@@ -1,0 +1,134 @@
+# COMMAND ----------
+# Module 6: Census Data Integration and Extrapolation
+
+def get_census_data():
+    """
+    Retrieve 2022 US Economic Census data at NAICS-3 level.
+    
+    Census variables used:
+    - NAICS: North American Industry Classification System code
+    - ESTAB: Number of establishments
+    - RCPTOT: Total receipts/revenue (in $1,000s)
+    - EMP: Total number of paid employees
+    - PAYANN: Annual payroll (in $1,000s)
+    """
+    import requests
+    import pandas as pd
+    
+    print("Retrieving 2022 US Economic Census data...")
+    
+    # Census API parameters
+    api_url = "https://api.census.gov/data/2022/ecnbasic"
+    params = {
+        # Variables to retrieve:
+        # NAICS = North American Industry Classification System code
+        # ESTAB = Number of establishments in the industry
+        # RCPTOT = Total receipts/revenue for the industry (in $1,000s)
+        # EMP = Total number of paid employees
+        # PAYANN = Annual payroll (in $1,000s)
+        "get": "NAICS,ESTAB,RCPTOT,EMP,PAYANN",
+        
+        # Geographic level (us = national level)
+        "for": "us:*",
+        
+        # NAICS ranges to include (major industry sectors)
+        # 31-33: Manufacturing
+        # 42: Wholesale Trade
+        # 44-45: Retail Trade
+        # 48-49: Transportation and Warehousing
+        # 51: Information
+        # 52: Finance and Insurance
+        # 53: Real Estate, Rental and Leasing
+        # 54: Professional, Scientific, and Technical Services
+        # 55: Management of Companies and Enterprises
+        # 56: Administrative and Support, Waste Management
+        # 61: Educational Services
+        # 62: Health Care and Social Assistance
+        # 71: Arts, Entertainment, and Recreation
+        # 72: Accommodation and Food Services
+        # 81: Other Services
+        "NAICS": "31-33,42-45,48-49,51-56,61-62,71-72,81",
+        
+        # Census API key (optional but recommended)
+        "key": "YOUR_API_KEY_HERE"  # Replace with your actual Census API key
+    }
+    
+    # Make API request
+    response = requests.get(api_url, params=params, timeout=60)
+    response.raise_for_status()  # Raise exception for HTTP errors
+    
+    # Process the JSON response
+    data = response.json()
+    headers = data[0]
+    rows = data[1:]
+    
+    # Create DataFrame from the data
+    census_pd = pd.DataFrame(rows, columns=headers)
+    
+    # Convert NAICS codes to 3-digit level
+    def clean_naics(code):
+        if code.startswith('31-33'):  # Manufacturing
+            return '31-33'
+        elif code.startswith('44-45'):  # Retail
+            return '44-45'
+        elif code.startswith('48-49'):  # Transportation
+            return '48-49'
+        elif len(code) >= 3 and code[2] != '-':  # Standard 3+ digit code
+            return code[:3]
+        else:
+            return code  # Keep as is if special format
+    
+    census_pd['naics3'] = census_pd['NAICS'].apply(clean_naics)
+    
+    # Convert numeric columns
+    for col_name in ['ESTAB', 'RCPTOT', 'EMP', 'PAYANN']:
+        census_pd[col_name] = pd.to_numeric(census_pd[col_name], errors='coerce')
+    
+    # Aggregate by 3-digit NAICS
+    census_pd_agg = census_pd.groupby('naics3').agg({
+        'ESTAB': 'sum',  # Sum of establishments
+        'RCPTOT': 'sum', # Sum of receipts/revenue
+        'EMP': 'sum',    # Sum of employees
+        'PAYANN': 'sum'  # Sum of annual payroll
+    }).reset_index()
+    
+    # Rename columns for consistency with our dataset
+    census_pd_agg.columns = [
+        'naics3',                  # 3-digit NAICS code
+        'census_establishments',   # Number of establishments
+        'census_receipts_total',   # Total receipts/revenue (in $1,000s)
+        'census_employees',        # Number of employees
+        'census_annual_payroll'    # Annual payroll (in $1,000s)
+    ]
+    
+    # Add data source column
+    census_pd_agg['data_source'] = "census_api_2022"
+    
+    # Convert to Spark DataFrame
+    census_df = spark.createDataFrame(census_pd_agg)
+    print(f"Successfully retrieved data for {len(census_pd_agg)} NAICS categories.")
+    
+    # Save for reference
+    census_df.write.mode("overwrite").parquet(f"{CENSUS_PATH}/census_2022_naics3.parquet")
+    return census_df
+
+# Get census data
+try:
+    census_df = get_census_data()
+    census_df.createOrReplaceTempView("census_2022")
+    print("\nCensus 2022 data (sample):")
+    
+    # Show sample with descriptive column headers
+    census_df.select(
+        "naics3", 
+        census_df["census_establishments"].alias("Establishments"),
+        (census_df["census_receipts_total"]/1000).alias("Revenue_Millions"),
+        census_df["census_employees"].alias("Employees"),
+        (census_df["census_annual_payroll"]/1000).alias("Payroll_Millions")
+    ).show(10)
+except Exception as e:
+    print(f"ERROR: Failed to retrieve Census data: {str(e)}")
+    print("Please ensure your environment has internet access and can reach the Census API.")
+    raise
+
+# COMMAND ----------
