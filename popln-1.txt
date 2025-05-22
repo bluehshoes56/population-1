@@ -1,1 +1,60 @@
-#test
+# COMMAND ----------
+# Backup original NAICS variables and update with aligned values
+
+# Import required to be safe
+from pyspark.sql.functions import col
+
+# First, check if the aligned columns exist
+existing_columns = all_mids.columns
+print("Available columns:", existing_columns)
+
+# Check if aligned columns exist before proceeding
+if "naics3_aligned" in existing_columns and "naics6_aligned" in existing_columns:
+    # Create backup columns
+    all_mids = all_mids.withColumn("naics3_original", col("naics3"))
+    all_mids = all_mids.withColumn("naics6_original", col("naics6"))
+    
+    print("Created backup of original NAICS values in naics3_original and naics6_original columns")
+    
+    # Replace original columns with aligned values
+    all_mids = all_mids.withColumn("naics3", col("naics3_aligned"))
+    all_mids = all_mids.withColumn("naics6", col("naics6_aligned"))
+    
+    print("Updated naics3 and naics6 columns with aligned values")
+    
+    # Verify the update with basic counts
+    updated_naics3_count = all_mids.filter(col("naics3_original") != col("naics3")).count()
+    updated_naics6_count = all_mids.filter(col("naics6_original") != col("naics6")).count()
+    
+    print(f"Updated {updated_naics3_count} records for naics3")
+    print(f"Updated {updated_naics6_count} records for naics6")
+    
+    # Prepare list of columns to drop
+    columns_to_drop = []
+    for column in ["naics3_aligned", "naics6_aligned"]:
+        if column in existing_columns:
+            columns_to_drop.append(column)
+    
+    # Check for other intermediate columns that might exist
+    for column in ["naics6_mapped", "naics3_from_naics6"]:
+        if column in existing_columns:
+            columns_to_drop.append(column)
+    
+    print(f"Columns that will be dropped: {columns_to_drop}")
+    
+    # Drop the columns if any exist to drop
+    if columns_to_drop:
+        all_mids = all_mids.drop(*columns_to_drop)
+        print("Removed intermediate processing columns")
+    else:
+        print("No intermediate columns found to remove")
+else:
+    print("Warning: naics3_aligned or naics6_aligned columns not found. Cannot update NAICS values.")
+    print("Available columns are:", existing_columns)
+    
+# Update the view with the current dataframe state, regardless of changes
+all_mids.createOrReplaceTempView("all_merchants")
+
+print("View updated successfully")
+
+# COMMAND ----------
