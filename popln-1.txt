@@ -1,134 +1,212 @@
 # COMMAND ----------
-# Module 6: Census Data Integration and Extrapolation
+# Module 2: Data Loading and NAICS Mapping/Regrouping
 
-def get_census_data():
-    """
-    Retrieve 2022 US Economic Census data at NAICS-3 level.
-    
-    Census variables used:
-    - NAICS: North American Industry Classification System code
-    - ESTAB: Number of establishments
-    - RCPTOT: Total receipts/revenue (in $1,000s)
-    - EMP: Total number of paid employees
-    - PAYANN: Annual payroll (in $1,000s)
-    """
-    import requests
-    import pandas as pd
-    
-    print("Retrieving 2022 US Economic Census data...")
-    
-    # Census API parameters
-    api_url = "https://api.census.gov/data/2022/ecnbasic"
-    params = {
-        # Variables to retrieve:
-        # NAICS = North American Industry Classification System code
-        # ESTAB = Number of establishments in the industry
-        # RCPTOT = Total receipts/revenue for the industry (in $1,000s)
-        # EMP = Total number of paid employees
-        # PAYANN = Annual payroll (in $1,000s)
-        "get": "NAICS,ESTAB,RCPTOT,EMP,PAYANN",
-        
-        # Geographic level (us = national level)
-        "for": "us:*",
-        
-        # NAICS ranges to include (major industry sectors)
-        # 31-33: Manufacturing
-        # 42: Wholesale Trade
-        # 44-45: Retail Trade
-        # 48-49: Transportation and Warehousing
-        # 51: Information
-        # 52: Finance and Insurance
-        # 53: Real Estate, Rental and Leasing
-        # 54: Professional, Scientific, and Technical Services
-        # 55: Management of Companies and Enterprises
-        # 56: Administrative and Support, Waste Management
-        # 61: Educational Services
-        # 62: Health Care and Social Assistance
-        # 71: Arts, Entertainment, and Recreation
-        # 72: Accommodation and Food Services
-        # 81: Other Services
-        "NAICS": "31-33,42-45,48-49,51-56,61-62,71-72,81",
-        
-        # Census API key (optional but recommended)
-        "key": "YOUR_API_KEY_HERE"  # Replace with your actual Census API key
-    }
-    
-    # Make API request
-    response = requests.get(api_url, params=params, timeout=60)
-    response.raise_for_status()  # Raise exception for HTTP errors
-    
-    # Process the JSON response
-    data = response.json()
-    headers = data[0]
-    rows = data[1:]
-    
-    # Create DataFrame from the data
-    census_pd = pd.DataFrame(rows, columns=headers)
-    
-    # Convert NAICS codes to 3-digit level
-    def clean_naics(code):
-        if code.startswith('31-33'):  # Manufacturing
-            return '31-33'
-        elif code.startswith('44-45'):  # Retail
-            return '44-45'
-        elif code.startswith('48-49'):  # Transportation
-            return '48-49'
-        elif len(code) >= 3 and code[2] != '-':  # Standard 3+ digit code
-            return code[:3]
-        else:
-            return code  # Keep as is if special format
-    
-    census_pd['naics3'] = census_pd['NAICS'].apply(clean_naics)
-    
-    # Convert numeric columns
-    for col_name in ['ESTAB', 'RCPTOT', 'EMP', 'PAYANN']:
-        census_pd[col_name] = pd.to_numeric(census_pd[col_name], errors='coerce')
-    
-    # Aggregate by 3-digit NAICS
-    census_pd_agg = census_pd.groupby('naics3').agg({
-        'ESTAB': 'sum',  # Sum of establishments
-        'RCPTOT': 'sum', # Sum of receipts/revenue
-        'EMP': 'sum',    # Sum of employees
-        'PAYANN': 'sum'  # Sum of annual payroll
-    }).reset_index()
-    
-    # Rename columns for consistency with our dataset
-    census_pd_agg.columns = [
-        'naics3',                  # 3-digit NAICS code
-        'census_establishments',   # Number of establishments
-        'census_receipts_total',   # Total receipts/revenue (in $1,000s)
-        'census_employees',        # Number of employees
-        'census_annual_payroll'    # Annual payroll (in $1,000s)
-    ]
-    
-    # Add data source column
-    census_pd_agg['data_source'] = "census_api_2022"
+# Import required libraries
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+
+print("Loading merchant data...")
+
+# COMMAND ----------
+# Reading the merchant data
+all_mids = spark.sql("""
+    SELECT *,
+        CASE 
+            WHEN latitude IS NULL AND address IS NULL THEN siteid
+            WHEN naics3 IS NULL AND (latitude IS NULL OR TRIM(latitude) = '') THEN siteid
+            WHEN latitude IS NULL OR TRIM(latitude) = '' THEN CONCAT(tax_id, '_', naics3, '_', address)
+            WHEN (naics3 IS NULL AND latitude IS NOT NULL) THEN CONCAT(tax_id, '_', mcc_code, '_', 
+                latitude, '_', longitude)
+            ELSE CONCAT(tax_id, '_', naics3, '_', latitude, '_', longitude)
+        END AS merchant_key
+    FROM prod_dcs_catalog.fsbi_live.mid_monthly_sb_flag_sba_threshold_process
+    WHERE 
+        adjusted_sales > 0
+""")
+
+# Convert adjusted_sales to float type to avoid type errors
+all_mids = all_mids.withColumn("adjusted_sales", col("adjusted_sales").cast("float"))
+
+# Register temporary view for SQL operations
+all_mids.createOrReplaceTempView("all_merchants")
+
+print(f"Loaded {all_mids.count()} merchant records")
+
+# COMMAND ----------
+# STEP 1: MCC to NAICS6 mapping
+print("Step 1: Applying MCC to NAICS6 mapping...")
+
+naics6_mapping = spark.sql("""
+    SELECT mcc_code, naics6 
+    FROM prod_dcs_catalog.fsbi_live.mcc_to_naics_mapping
+""")
+naics6_mapping.createOrReplaceTempView("naics6_mapping")
+
+# Apply mapping to all_mids dataframe
+all_mids = spark.sql("""
+    SELECT a.*, 
+           COALESCE(n.naics6, a.naics6) as naics6_mapped
+    FROM all_merchants a
+    LEFT JOIN naics6_mapping n ON a.mcc_code = n.mcc_code
+""")
+
+print("Successfully applied MCC to NAICS6 mapping")
+
+# COMMAND ----------
+# STEP 2: NAICS3 extraction from NAICS6
+print("Step 2: Extracting NAICS3 from NAICS6...")
+
+all_mids = all_mids.withColumn("naics3_from_naics6", 
+                               when(col("naics6_mapped").isNotNull() & (length(col("naics6_mapped")) >= 3), 
+                                    substring(col("naics6_mapped"), 1, 3))
+                               .otherwise(col("naics3")))
+
+# COMMAND ----------
+# STEP 3: NAICS Alignment and Regrouping
+print("Step 3: Applying NAICS alignment rules...")
+
+# Initialize with original values
+all_mids = all_mids.withColumn("naics6_aligned", col("naics6_mapped"))
+all_mids = all_mids.withColumn("naics3_aligned", col("naics3_from_naics6"))
+
+# Rule 1: NAICS 336 → 459
+all_mids = all_mids.withColumn("naics6_aligned", 
+    when(col("naics3_from_naics6") == "336", "459999")
+    .otherwise(col("naics6_aligned"))
+)
+
+all_mids = all_mids.withColumn("naics3_aligned", 
+    when(col("naics3_from_naics6") == "336", "459")
+    .otherwise(col("naics3_aligned"))
+)
+
+# Rule 2: NAICS 311 → 722
+all_mids = all_mids.withColumn("naics6_aligned", 
+    when(col("naics3_aligned") == "311", "722513")
+    .otherwise(col("naics6_aligned"))
+)
+
+all_mids = all_mids.withColumn("naics3_aligned", 
+    when(col("naics3_aligned") == "311", "722")
+    .otherwise(col("naics3_aligned"))
+)
+
+# Rule 3: NAICS 92 → 713
+all_mids = all_mids.withColumn("naics6_aligned", 
+    when(col("naics3_aligned") == "92", "7131")
+    .otherwise(col("naics6_aligned"))
+)
+
+# Rule 4: NAICS 486 → 457
+all_mids = all_mids.withColumn("naics3_aligned", 
+    when(col("naics3_aligned") == "486", "457")
+    .otherwise(col("naics3_aligned"))
+)
+
+all_mids = all_mids.withColumn("naics6_aligned", 
+    when(col("naics3_aligned") == "457", "457210")
+    .otherwise(col("naics6_aligned"))
+)
+
+# Rule 5: MCC code specific alignments
+all_mids = all_mids.withColumn("naics6_aligned", 
+    when(col("mcc_code").isin("5541", "5542", "7511"), "457110")
+    .otherwise(col("naics6_aligned"))
+)
+
+all_mids = all_mids.withColumn("naics3_aligned", 
+    when(col("mcc_code").isin("7801", "713"), "713")
+    .otherwise(col("naics3_aligned"))
+)
+
+print("Applied NAICS alignment rules")
+
+# COMMAND ----------
+# STEP 4: Drop specific NAICS categories
+print("Step 4: Dropping specified NAICS categories...")
+print(f"Before filtering - Total merchants: {all_mids.count()}")
+
+# Drop NAICS 524 (Insurance Carriers), 531 (Real Estate), 221 (Utilities)
+all_mids_filtered = all_mids.filter(
+    ~col("naics3_aligned").isin("524", "531", "221")
+)
+
+print(f"After filtering - Total merchants: {all_mids_filtered.count()}")
+dropped_count = all_mids.count() - all_mids_filtered.count()
+print(f"Dropped {dropped_count} merchants from excluded NAICS categories")
+
+# Update the main dataframe reference
+all_mids = all_mids_filtered
+
+# COMMAND ----------
+# STEP 5: Add NAICS from Excel file
+print("Step 5: Reading additional NAICS categories from Excel...")
+
+# Read Excel file from workspace
+excel_path = "/Workspace/input/NAICS6_check_shared_by_Dan.xlsx"
+
+# Convert Excel to Pandas DataFrame first, then to Spark DataFrame
+try:
+    # Read Excel file using pandas
+    excel_pandas_df = pd.read_excel(excel_path, sheet_name=0)  # Read first sheet
     
     # Convert to Spark DataFrame
-    census_df = spark.createDataFrame(census_pd_agg)
-    print(f"Successfully retrieved data for {len(census_pd_agg)} NAICS categories.")
+    additional_naics_df = spark.createDataFrame(excel_pandas_df)
     
-    # Save for reference
-    census_df.write.mode("overwrite").parquet(f"{CENSUS_PATH}/census_2022_naics3.parquet")
-    return census_df
-
-# Get census data
-try:
-    census_df = get_census_data()
-    census_df.createOrReplaceTempView("census_2022")
-    print("\nCensus 2022 data (sample):")
+    print("Excel file columns:", additional_naics_df.columns)
+    print(f"Additional NAICS records: {additional_naics_df.count()}")
     
-    # Show sample with descriptive column headers
-    census_df.select(
-        "naics3", 
-        census_df["census_establishments"].alias("Establishments"),
-        (census_df["census_receipts_total"]/1000).alias("Revenue_Millions"),
-        census_df["census_employees"].alias("Employees"),
-        (census_df["census_annual_payroll"]/1000).alias("Payroll_Millions")
-    ).show(10)
+    # Show sample of Excel data
+    print("Sample from Excel file:")
+    additional_naics_df.show(5, truncate=False)
+    
+    # Filter for records to keep (where Reason column indicates "Leave it in")
+    if "Reason" in additional_naics_df.columns:
+        keep_records = additional_naics_df.filter(
+            col("Reason").contains("Leave it in") | 
+            col("Reason").isNull()
+        )
+        print(f"Records to keep: {keep_records.count()}")
+    
 except Exception as e:
-    print(f"ERROR: Failed to retrieve Census data: {str(e)}")
-    print("Please ensure your environment has internet access and can reach the Census API.")
-    raise
+    print(f"Warning: Could not read Excel file: {e}")
+    print("Continuing without additional NAICS data")
+
+# COMMAND ----------
+# Create final merchant_key using aligned NAICS
+all_mids = all_mids.withColumn("merchant_key_final",
+    when(col("latitude").isNull() & col("address").isNull(), col("siteid"))
+    .when(col("naics3_aligned").isNull() & (col("latitude").isNull() | (trim(col("latitude")) == "")), col("siteid"))
+    .when(col("latitude").isNull() | (trim(col("latitude")) == ""), 
+          concat(col("tax_id"), lit("_"), col("naics3_aligned"), lit("_"), col("address")))
+    .when(col("naics3_aligned").isNull() & col("latitude").isNotNull(), 
+          concat(col("tax_id"), lit("_"), col("mcc_code"), lit("_"), col("latitude"), lit("_"), col("longitude")))
+    .otherwise(concat(col("tax_id"), lit("_"), col("naics3_aligned"), lit("_"), col("latitude"), lit("_"), col("longitude")))
+)
+
+# Register updated temporary view
+all_mids.createOrReplaceTempView("all_merchants")
+
+# COMMAND ----------
+# Display final statistics
+merchant_count = all_mids.count()
+naics_count = all_mids.select("naics3_aligned").distinct().count()
+month_count = all_mids.select("txn_year_month").distinct().count()
+
+print(f"Final merchant count: {merchant_count}")
+print(f"Distinct aligned NAICS3 codes: {naics_count}")
+print(f"Months in dataset: {month_count}")
+
+# Show sample of alignment results
+print("\nSample of NAICS alignment results:")
+all_mids.select("naics3", "naics3_aligned", "naics6_aligned", "mcc_code").distinct().show(20, truncate=False)
+
+# Show alignment summary
+print("\nNAICS3 alignment summary:")
+all_mids.groupBy("naics3", "naics3_aligned").count().orderBy("count", ascending=False).show(20, truncate=False)
+
+print("Module 2: Data Loading and NAICS Mapping completed successfully!")
 
 # COMMAND ----------
