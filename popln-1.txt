@@ -1,1 +1,68 @@
-# tt
+# COMMAND ----------
+# Backup original NAICS variables and update with aligned values
+
+# Import required libraries
+from pyspark.sql.functions import col
+
+# First, check what columns actually exist
+existing_columns = all_mids.columns
+print("Available columns:", existing_columns)
+
+# Create backup for naics3 if not already backed up
+if "naics3_original" not in existing_columns:
+    # Check if naics3 exists first
+    if "naics3" in existing_columns:
+        all_mids = all_mids.withColumn("naics3_original", col("naics3"))
+        print("Created naics3_original backup column")
+    else:
+        print("Warning: naics3 column not found, cannot create backup")
+else:
+    print("naics3_original already exists")
+
+# For naics6, we need to verify it exists first
+if "naics6" in existing_columns:
+    # Create backup if it doesn't exist
+    if "naics6_original" not in existing_columns:
+        all_mids = all_mids.withColumn("naics6_original", col("naics6"))
+        print("Created naics6_original backup column")
+    else:
+        print("naics6_original already exists")
+else:
+    print("Warning: naics6 column not found in dataset")
+
+# Now update the original columns with aligned values
+if "naics3" in existing_columns and "naics3_aligned" in existing_columns:
+    all_mids = all_mids.withColumn("naics3", col("naics3_aligned"))
+    print("Updated naics3 with aligned values")
+else:
+    print("Warning: naics3 or naics3_aligned column not found, cannot update naics3")
+
+if "naics6" in existing_columns and "naics6_aligned" in existing_columns:
+    all_mids = all_mids.withColumn("naics6", col("naics6_aligned"))
+    print("Updated naics6 with aligned values")
+elif "naics6" not in existing_columns and "naics6_aligned" in existing_columns:
+    # If naics6 doesn't exist but aligned does, create it
+    all_mids = all_mids.withColumn("naics6", col("naics6_aligned"))
+    print("Created new naics6 column with aligned values")
+else:
+    print("Warning: naics6_aligned column not found, cannot update naics6")
+
+# Always update the view
+all_mids.createOrReplaceTempView("all_merchants")
+print("View updated successfully")
+
+# Show sample of final data
+print("\nSample of updated columns (5 rows):")
+columns_to_show = []
+if "naics3" in existing_columns:
+    columns_to_show.append("naics3")
+if "naics3_original" in existing_columns:
+    columns_to_show.append("naics3_original")
+if "naics6" in existing_columns:
+    columns_to_show.append("naics6")
+if "naics6_original" in existing_columns:
+    columns_to_show.append("naics6_original")
+
+display(all_mids.select(*columns_to_show).limit(5))
+
+# COMMAND ----------
