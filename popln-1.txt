@@ -1,1 +1,366 @@
 #tt
+# COMMAND ----------
+# Enhanced 14-Month Rolling Window Analysis - Complete Fixed Version
+# Handles all_mids as Python DataFrame
+
+print("Creating enhanced 14-month rolling window analysis with detailed metrics...")
+
+# STEP 1: Register the Python DataFrame as a SQL view
+all_mids.createOrReplaceTempView("all_mids")
+print("all_mids DataFrame registered as SQL view")
+
+# Verify the table is now available
+print("Checking all_mids table availability:")
+spark.sql("SELECT COUNT(*) as record_count FROM all_mids").show()
+
+# COMMAND ----------
+# Identify the valid reference months (those with full 14-month windows)
+
+reference_months = spark.sql("""
+WITH all_months AS (
+    SELECT DISTINCT txn_year_month
+    FROM all_mids
+    ORDER BY txn_year_month
+),
+valid_reference_months AS (
+    SELECT 
+        txn_year_month as reference_month,
+        ADD_MONTHS(CAST(CONCAT(SUBSTR(CAST(txn_year_month AS STRING), 1, 4), '-', 
+                              SUBSTR(CAST(txn_year_month AS STRING), 5, 2), '-01') AS DATE), -13) as window_start_date,
+        txn_year_month as window_end
+    FROM all_months
+    WHERE txn_year_month >= 202002  -- Start from Feb 2020
+),
+valid_reference_with_months AS (
+    SELECT 
+        reference_month,
+        CAST(DATE_FORMAT(window_start_date, 'yyyyMM') AS INT) as window_start,
+        window_end
+    FROM valid_reference_months
+)
+SELECT * FROM valid_reference_with_months
+ORDER BY reference_month
+""")
+
+reference_months.createOrReplaceTempView("reference_months")
+
+print("Valid reference months:")
+reference_months.show(50)
+
+# COMMAND ----------
+# Create comprehensive merchant presence analysis with all metrics
+
+merchant_window_analysis_enhanced = spark.sql("""
+WITH merchant_presence_by_window AS (
+    SELECT 
+        rm.reference_month,
+        rm.window_start,
+        rm.window_end,
+        am.merchant_key,
+        am.naics3,
+        -- Basic presence metrics
+        COUNT(DISTINCT am.txn_year_month) as months_with_sales,
+        COUNT(DISTINCT CASE WHEN am.sales > 0 THEN am.txn_year_month END) as months_with_positive_sales,
+        
+        -- Sales metrics
+        COALESCE(SUM(am.sales), 0) as total_sales_in_window,
+        COALESCE(AVG(CASE WHEN am.sales > 0 THEN am.sales END), 0) as avg_monthly_sales,
+        
+        -- Transaction metrics
+        COALESCE(SUM(am.total_txn), 0) as total_txn_in_window,
+        COALESCE(AVG(CASE WHEN am.total_txn > 0 THEN am.total_txn END), 0) as avg_monthly_txn,
+        
+        -- Sales per transaction (only for months with transactions)
+        CASE WHEN SUM(am.total_txn) > 0 
+             THEN SUM(am.sales) / SUM(am.total_txn) 
+             ELSE 0 END as sales_per_transaction,
+        
+        -- Sales per merchant per month (only for months with sales)
+        CASE WHEN COUNT(DISTINCT CASE WHEN am.sales > 0 THEN am.txn_year_month END) > 0
+             THEN SUM(am.sales) / COUNT(DISTINCT CASE WHEN am.sales > 0 THEN am.txn_year_month END)
+             ELSE 0 END as sales_per_merchant_per_active_month,
+             
+        -- Flag for merchants with positive sales in the window
+        CASE WHEN COALESCE(SUM(am.sales), 0) > 0 THEN 1 ELSE 0 END as has_positive_sales
+        
+    FROM reference_months rm
+    LEFT JOIN all_mids am ON am.txn_year_month BETWEEN rm.window_start AND rm.window_end
+    WHERE am.merchant_key IS NOT NULL
+    GROUP BY rm.reference_month, rm.window_start, rm.window_end, am.merchant_key, am.naics3
+),
+categorized_presence AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN months_with_sales = 0 THEN 'no_presence'
+            WHEN months_with_sales BETWEEN 1 AND 4 THEN 'low_presence_1_4'
+            WHEN months_with_sales BETWEEN 5 AND 8 THEN 'medium_presence_5_8'
+            WHEN months_with_sales BETWEEN 9 AND 12 THEN 'high_presence_9_12'
+            WHEN months_with_sales = 13 THEN 'almost_full_13'
+            WHEN months_with_sales = 14 THEN 'full_presence_14'
+            ELSE 'other'
+        END as presence_category
+    FROM merchant_presence_by_window
+)
+SELECT * FROM categorized_presence
+ORDER BY reference_month, naics3, merchant_key
+""")
+
+merchant_window_analysis_enhanced.createOrReplaceTempView("merchant_window_analysis_enhanced")
+
+print("Sample of enhanced merchant window analysis:")
+merchant_window_analysis_enhanced.select(
+    "reference_month", "merchant_key", "naics3", "months_with_sales", 
+    "total_sales_in_window", "sales_per_merchant_per_active_month", 
+    "total_txn_in_window", "sales_per_transaction", "presence_category"
+).show(15, truncate=False)
+
+# COMMAND ----------
+# Create comprehensive summary with all requested metrics
+
+reference_month_summary_enhanced = spark.sql("""
+SELECT 
+    reference_month,
+    naics3,
+    presence_category,
+    
+    -- Merchant counts
+    COUNT(DISTINCT merchant_key) as merchant_count,
+    
+    -- Sales metrics
+    SUM(total_sales_in_window) as total_sales,
+    CASE WHEN COUNT(DISTINCT merchant_key) > 0 
+         THEN SUM(total_sales_in_window) / COUNT(DISTINCT merchant_key) 
+         ELSE 0 END as avg_sales_per_merchant,
+    
+    -- Sales per merchant per active month (true ratio)
+    AVG(sales_per_merchant_per_active_month) as avg_sales_per_merchant_per_active_month,
+    
+    -- Transaction metrics
+    SUM(total_txn_in_window) as total_transactions,
+    CASE WHEN COUNT(DISTINCT merchant_key) > 0 
+         THEN SUM(total_txn_in_window) / COUNT(DISTINCT merchant_key) 
+         ELSE 0 END as avg_txn_per_merchant,
+    
+    -- Sales per transaction
+    CASE WHEN SUM(total_txn_in_window) > 0 
+         THEN SUM(total_sales_in_window) / SUM(total_txn_in_window) 
+         ELSE 0 END as overall_sales_per_transaction,
+    
+    -- Presence metrics
+    AVG(months_with_sales) as avg_months_with_sales,
+    AVG(months_with_positive_sales) as avg_months_with_positive_sales
+    
+FROM merchant_window_analysis_enhanced
+GROUP BY reference_month, naics3, presence_category
+ORDER BY reference_month, naics3, presence_category
+""")
+
+reference_month_summary_enhanced.createOrReplaceTempView("reference_month_summary_enhanced")
+
+print("Enhanced summary by reference month and presence category:")
+reference_month_summary_enhanced.show(30, truncate=False)
+
+# COMMAND ----------
+# Create enhanced pivot table with key metrics
+
+reference_month_pivot_enhanced = spark.sql("""
+SELECT 
+    reference_month,
+    naics3,
+    
+    -- Merchant counts by presence category
+    SUM(CASE WHEN presence_category = 'no_presence' THEN merchant_count ELSE 0 END) as no_presence_count,
+    SUM(CASE WHEN presence_category = 'low_presence_1_4' THEN merchant_count ELSE 0 END) as low_presence_count,
+    SUM(CASE WHEN presence_category = 'medium_presence_5_8' THEN merchant_count ELSE 0 END) as medium_presence_count,
+    SUM(CASE WHEN presence_category = 'high_presence_9_12' THEN merchant_count ELSE 0 END) as high_presence_count,
+    SUM(CASE WHEN presence_category = 'almost_full_13' THEN merchant_count ELSE 0 END) as almost_full_count,
+    SUM(CASE WHEN presence_category = 'full_presence_14' THEN merchant_count ELSE 0 END) as full_presence_count,
+    SUM(merchant_count) as total_merchants,
+    
+    -- Total sales and transactions
+    SUM(total_sales) as total_sales_all_categories,
+    SUM(total_transactions) as total_transactions_all_categories,
+    
+    -- Overall ratios
+    CASE WHEN SUM(merchant_count) > 0 
+         THEN SUM(total_sales) / SUM(merchant_count) 
+         ELSE 0 END as avg_sales_per_merchant_overall,
+         
+    CASE WHEN SUM(total_transactions) > 0 
+         THEN SUM(total_sales) / SUM(total_transactions) 
+         ELSE 0 END as avg_sales_per_transaction_overall,
+         
+    -- Percentage distributions
+    CASE WHEN SUM(merchant_count) > 0 
+         THEN ROUND(SUM(CASE WHEN presence_category = 'full_presence_14' THEN merchant_count ELSE 0 END) * 100.0 / SUM(merchant_count), 1) 
+         ELSE 0 END as pct_full_presence,
+         
+    CASE WHEN SUM(merchant_count) > 0 
+         THEN ROUND((SUM(CASE WHEN presence_category IN ('high_presence_9_12', 'almost_full_13', 'full_presence_14') THEN merchant_count ELSE 0 END)) * 100.0 / SUM(merchant_count), 1) 
+         ELSE 0 END as pct_high_presence_9_plus
+
+FROM reference_month_summary_enhanced
+GROUP BY reference_month, naics3
+ORDER BY reference_month, naics3
+""")
+
+reference_month_pivot_enhanced.createOrReplaceTempView("reference_month_pivot_enhanced")
+
+print("Enhanced pivot table with all metrics:")
+reference_month_pivot_enhanced.show(20, truncate=False)
+
+# COMMAND ----------
+# Detailed metrics by NAICS and reference month for full presence merchants only
+
+full_presence_metrics = spark.sql("""
+SELECT 
+    reference_month,
+    naics3,
+    COUNT(DISTINCT merchant_key) as full_presence_merchant_count,
+    
+    -- Sales metrics for full presence merchants
+    SUM(total_sales_in_window) as total_sales_full_presence,
+    AVG(total_sales_in_window) as avg_sales_per_full_presence_merchant,
+    AVG(sales_per_merchant_per_active_month) as avg_sales_per_month_per_merchant,
+    
+    -- Transaction metrics for full presence merchants  
+    SUM(total_txn_in_window) as total_txn_full_presence,
+    AVG(total_txn_in_window) as avg_txn_per_full_presence_merchant,
+    
+    -- Sales per transaction for full presence merchants
+    CASE WHEN SUM(total_txn_in_window) > 0 
+         THEN SUM(total_sales_in_window) / SUM(total_txn_in_window) 
+         ELSE 0 END as sales_per_txn_full_presence,
+         
+    -- Monthly averages (dividing by 14 since these are full presence merchants)
+    AVG(total_sales_in_window) / 14 as avg_monthly_sales_per_merchant,
+    AVG(total_txn_in_window) / 14 as avg_monthly_txn_per_merchant
+
+FROM merchant_window_analysis_enhanced
+WHERE presence_category = 'full_presence_14'
+GROUP BY reference_month, naics3
+ORDER BY reference_month, naics3
+""")
+
+full_presence_metrics.createOrReplaceTempView("full_presence_metrics")
+
+print("Detailed metrics for full presence merchants only:")
+full_presence_metrics.show(25, truncate=False)
+
+# COMMAND ----------
+# Cross-tabulation with enhanced metrics
+
+print("Creating enhanced cross-tabulation with metrics...")
+
+cross_tabulation_enhanced = spark.sql("""
+WITH consecutive_months AS (
+    SELECT 
+        reference_month as current_ref_month,
+        LEAD(reference_month) OVER (ORDER BY reference_month) as next_ref_month
+    FROM (SELECT DISTINCT reference_month FROM reference_months ORDER BY reference_month)
+),
+full_presence_merchants AS (
+    SELECT 
+        reference_month,
+        naics3,
+        merchant_key,
+        total_sales_in_window,
+        total_txn_in_window,
+        sales_per_transaction
+    FROM merchant_window_analysis_enhanced
+    WHERE presence_category = 'full_presence_14'
+),
+merchant_overlap AS (
+    SELECT 
+        cm.current_ref_month,
+        cm.next_ref_month,
+        fp1.naics3,
+        
+        -- Counts
+        COUNT(DISTINCT fp1.merchant_key) as merchants_current_month,
+        COUNT(DISTINCT fp2.merchant_key) as merchants_next_month,
+        COUNT(DISTINCT CASE WHEN fp2.merchant_key IS NOT NULL THEN fp1.merchant_key END) as common_merchants,
+        COUNT(DISTINCT CASE WHEN fp2.merchant_key IS NULL THEN fp1.merchant_key END) as lost_merchants,
+        COUNT(DISTINCT CASE WHEN fp1.merchant_key IS NULL THEN fp2.merchant_key END) as new_merchants,
+        
+        -- Sales metrics for common merchants
+        AVG(CASE WHEN fp2.merchant_key IS NOT NULL THEN fp1.total_sales_in_window END) as avg_sales_common_current,
+        AVG(CASE WHEN fp2.merchant_key IS NOT NULL THEN fp2.total_sales_in_window END) as avg_sales_common_next,
+        
+        -- Transaction metrics for common merchants
+        AVG(CASE WHEN fp2.merchant_key IS NOT NULL THEN fp1.total_txn_in_window END) as avg_txn_common_current,
+        AVG(CASE WHEN fp2.merchant_key IS NOT NULL THEN fp2.total_txn_in_window END) as avg_txn_common_next
+        
+    FROM consecutive_months cm
+    LEFT JOIN full_presence_merchants fp1 ON fp1.reference_month = cm.current_ref_month
+    LEFT JOIN full_presence_merchants fp2 ON fp2.reference_month = cm.next_ref_month 
+                                            AND fp2.merchant_key = fp1.merchant_key 
+                                            AND fp2.naics3 = fp1.naics3
+    WHERE cm.next_ref_month IS NOT NULL
+    GROUP BY cm.current_ref_month, cm.next_ref_month, fp1.naics3
+)
+SELECT 
+    current_ref_month,
+    next_ref_month,
+    naics3,
+    merchants_current_month,
+    merchants_next_month,
+    common_merchants,
+    lost_merchants,
+    new_merchants,
+    
+    -- Retention rate
+    CASE WHEN merchants_current_month > 0 
+         THEN ROUND(common_merchants * 100.0 / merchants_current_month, 1) 
+         ELSE 0 END as retention_rate_pct,
+         
+    -- Sales metrics
+    ROUND(avg_sales_common_current, 2) as avg_sales_common_current,
+    ROUND(avg_sales_common_next, 2) as avg_sales_common_next,
+    
+    -- Sales growth for common merchants
+    CASE WHEN avg_sales_common_current > 0 
+         THEN ROUND((avg_sales_common_next - avg_sales_common_current) * 100.0 / avg_sales_common_current, 1)
+         ELSE 0 END as sales_growth_pct_common_merchants,
+         
+    -- Transaction metrics  
+    ROUND(avg_txn_common_current, 0) as avg_txn_common_current,
+    ROUND(avg_txn_common_next, 0) as avg_txn_common_next
+
+FROM merchant_overlap
+WHERE naics3 IS NOT NULL
+ORDER BY current_ref_month, naics3
+""")
+
+cross_tabulation_enhanced.createOrReplaceTempView("cross_tabulation_enhanced")
+
+print("Enhanced cross-tabulation with sales and transaction metrics:")
+cross_tabulation_enhanced.show(30, truncate=False)
+
+# COMMAND ----------
+# Final summary of all views created
+
+print("""
+Enhanced 14-Month Rolling Window Analysis Complete!
+
+Key Views Created:
+1. reference_months - Valid reference months starting from Feb 2020
+2. merchant_window_analysis_enhanced - Individual merchant presence with all metrics
+3. reference_month_summary_enhanced - Summary by reference month and presence category
+4. reference_month_pivot_enhanced - Pivot table with key metrics
+5. full_presence_metrics - Detailed metrics for full presence merchants only
+6. cross_tabulation_enhanced - Cross-tabulation with sales and transaction metrics
+
+All metrics include:
+- Merchant counts by presence category
+- Total sales and sales per merchant
+- Sales per merchant per active month (true ratio)
+- Transaction counts and sales per transaction
+- Retention rates and sales growth for common merchants
+- Percentage distributions and presence analytics
+
+Each reference month analyzes merchant presence in the preceding 14-month window!
+""")
+
+# COMMAND ----------
