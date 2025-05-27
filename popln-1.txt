@@ -1,1 +1,277 @@
 #wsy
+# COMMAND ----------
+# Create Clean, Easy-to-Read Dashboard Views
+
+print("Creating clean, easy-to-read dashboard views...")
+
+# COMMAND ----------
+# View 1: Clean Reference Month Summary - High Level Overview
+
+clean_monthly_summary = spark.sql("""
+SELECT 
+    CONCAT(SUBSTR(CAST(reference_month AS STRING), 1, 4), '-', 
+           SUBSTR(CAST(reference_month AS STRING), 5, 2)) as ref_month,
+    naics3,
+    total_merchants,
+    full_presence_count as merchants_14_months,
+    ROUND(pct_full_presence, 1) as pct_14_month,
+    ROUND(pct_high_presence_9_plus, 1) as pct_9_plus_months,
+    
+    -- Format sales in millions/billions
+    CASE 
+        WHEN total_sales_all_categories >= 1000000000 THEN CONCAT(ROUND(total_sales_all_categories/1000000000, 1), 'B')
+        WHEN total_sales_all_categories >= 1000000 THEN CONCAT(ROUND(total_sales_all_categories/1000000, 1), 'M')
+        WHEN total_sales_all_categories >= 1000 THEN CONCAT(ROUND(total_sales_all_categories/1000, 1), 'K')
+        ELSE CAST(ROUND(total_sales_all_categories, 0) AS STRING)
+    END as total_sales_formatted,
+    
+    -- Format average sales per merchant
+    CASE 
+        WHEN avg_sales_per_merchant_overall >= 1000000 THEN CONCAT(ROUND(avg_sales_per_merchant_overall/1000000, 1), 'M')
+        WHEN avg_sales_per_merchant_overall >= 1000 THEN CONCAT(ROUND(avg_sales_per_merchant_overall/1000, 1), 'K')
+        ELSE CAST(ROUND(avg_sales_per_merchant_overall, 0) AS STRING)
+    END as avg_sales_per_merchant,
+    
+    ROUND(avg_sales_per_transaction_overall, 2) as avg_sales_per_txn
+
+FROM reference_month_pivot_enhanced
+WHERE total_merchants >= 50  -- Filter out small categories
+ORDER BY reference_month DESC, total_merchants DESC
+""")
+
+clean_monthly_summary.createOrReplaceTempView("clean_monthly_summary")
+
+print("Clean Monthly Summary (Most Recent First):")
+clean_monthly_summary.show(25, truncate=False)
+
+# COMMAND ----------
+# View 2: Merchant Presence Distribution - Easy to Read
+
+presence_distribution = spark.sql("""
+SELECT 
+    CONCAT(SUBSTR(CAST(reference_month AS STRING), 1, 4), '-', 
+           SUBSTR(CAST(reference_month AS STRING), 5, 2)) as ref_month,
+    naics3,
+    
+    -- Show counts in easy format
+    FORMAT_NUMBER(no_presence_count, 0) as no_presence,
+    FORMAT_NUMBER(low_presence_count, 0) as low_1_4_months,
+    FORMAT_NUMBER(medium_presence_count, 0) as medium_5_8_months,
+    FORMAT_NUMBER(high_presence_count, 0) as high_9_12_months,
+    FORMAT_NUMBER(almost_full_count, 0) as almost_full_13_months,
+    FORMAT_NUMBER(full_presence_count, 0) as full_14_months,
+    FORMAT_NUMBER(total_merchants, 0) as total_merchants,
+    
+    -- Show percentages
+    CONCAT(ROUND(pct_full_presence, 1), '%') as pct_full_presence,
+    CONCAT(ROUND(pct_high_presence_9_plus, 1), '%') as pct_high_presence
+
+FROM reference_month_pivot_enhanced
+WHERE total_merchants >= 50
+ORDER BY reference_month DESC, total_merchants DESC
+""")
+
+presence_distribution.createOrReplaceTempView("presence_distribution")
+
+print("Merchant Presence Distribution (Formatted Numbers):")
+presence_distribution.show(20, truncate=False)
+
+# COMMAND ----------
+# View 3: Top NAICS by Reference Month - Focus on Key Industries
+
+top_naics_by_month = spark.sql("""
+WITH ranked_naics AS (
+    SELECT 
+        CONCAT(SUBSTR(CAST(reference_month AS STRING), 1, 4), '-', 
+               SUBSTR(CAST(reference_month AS STRING), 5, 2)) as ref_month,
+        reference_month,
+        naics3,
+        total_merchants,
+        full_presence_count,
+        pct_full_presence,
+        total_sales_all_categories,
+        ROW_NUMBER() OVER (PARTITION BY reference_month ORDER BY total_merchants DESC) as rank_by_merchants,
+        ROW_NUMBER() OVER (PARTITION BY reference_month ORDER BY total_sales_all_categories DESC) as rank_by_sales
+    FROM reference_month_pivot_enhanced
+    WHERE total_merchants >= 100  -- Only significant categories
+)
+SELECT 
+    ref_month,
+    naics3,
+    FORMAT_NUMBER(total_merchants, 0) as merchants,
+    FORMAT_NUMBER(full_presence_count, 0) as full_presence,
+    CONCAT(ROUND(pct_full_presence, 1), '%') as pct_full,
+    
+    CASE 
+        WHEN total_sales_all_categories >= 1000000000 THEN CONCAT(ROUND(total_sales_all_categories/1000000000, 1), 'B')
+        WHEN total_sales_all_categories >= 1000000 THEN CONCAT(ROUND(total_sales_all_categories/1000000, 1), 'M')
+        ELSE CONCAT(ROUND(total_sales_all_categories/1000, 1), 'K')
+    END as total_sales,
+    
+    rank_by_merchants as merchant_rank,
+    rank_by_sales as sales_rank
+
+FROM ranked_naics
+WHERE rank_by_merchants <= 5  -- Top 5 by merchant count
+ORDER BY reference_month DESC, rank_by_merchants
+""")
+
+top_naics_by_month.createOrReplaceTempView("top_naics_by_month")
+
+print("Top 5 NAICS by Merchant Count per Reference Month:")
+top_naics_by_month.show(30, truncate=False)
+
+# COMMAND ----------
+# View 4: Merchant Retention Analysis - Easy to Read
+
+retention_analysis = spark.sql("""
+SELECT 
+    CONCAT(SUBSTR(CAST(current_ref_month AS STRING), 1, 4), '-', 
+           SUBSTR(CAST(current_ref_month AS STRING), 5, 2)) as current_month,
+    CONCAT(SUBSTR(CAST(next_ref_month AS STRING), 1, 4), '-', 
+           SUBSTR(CAST(next_ref_month AS STRING), 5, 2)) as next_month,
+    naics3,
+    
+    -- Merchant counts
+    FORMAT_NUMBER(merchants_current_month, 0) as merchants_current,
+    FORMAT_NUMBER(merchants_next_month, 0) as merchants_next,
+    FORMAT_NUMBER(common_merchants, 0) as retained,
+    FORMAT_NUMBER(lost_merchants, 0) as lost,
+    FORMAT_NUMBER(new_merchants, 0) as new_merchants,
+    
+    -- Retention rate
+    CONCAT(retention_rate_pct, '%') as retention_rate,
+    
+    -- Sales growth
+    CASE 
+        WHEN sales_growth_pct_common_merchants > 0 THEN CONCAT('+', sales_growth_pct_common_merchants, '%')
+        ELSE CONCAT(sales_growth_pct_common_merchants, '%')
+    END as sales_growth,
+    
+    -- Average sales (formatted)
+    CASE 
+        WHEN avg_sales_common_current >= 1000000 THEN CONCAT(ROUND(avg_sales_common_current/1000000, 1), 'M')
+        WHEN avg_sales_common_current >= 1000 THEN CONCAT(ROUND(avg_sales_common_current/1000, 1), 'K')
+        ELSE CAST(ROUND(avg_sales_common_current, 0) AS STRING)
+    END as avg_sales_current,
+    
+    CASE 
+        WHEN avg_sales_common_next >= 1000000 THEN CONCAT(ROUND(avg_sales_common_next/1000000, 1), 'M')
+        WHEN avg_sales_common_next >= 1000 THEN CONCAT(ROUND(avg_sales_common_next/1000, 1), 'K')
+        ELSE CAST(ROUND(avg_sales_common_next, 0) AS STRING)
+    END as avg_sales_next
+
+FROM cross_tabulation_enhanced
+WHERE merchants_current_month >= 50  -- Filter small categories
+ORDER BY current_ref_month DESC, merchants_current_month DESC
+""")
+
+retention_analysis.createOrReplaceTempView("retention_analysis")
+
+print("Merchant Retention Analysis (Month-to-Month):")
+retention_analysis.show(25, truncate=False)
+
+# COMMAND ----------
+# View 5: Full Presence Merchants - Detailed Metrics
+
+full_presence_clean = spark.sql("""
+SELECT 
+    CONCAT(SUBSTR(CAST(reference_month AS STRING), 1, 4), '-', 
+           SUBSTR(CAST(reference_month AS STRING), 5, 2)) as ref_month,
+    naics3,
+    FORMAT_NUMBER(full_presence_merchant_count, 0) as merchant_count,
+    
+    -- Total sales formatted
+    CASE 
+        WHEN total_sales_full_presence >= 1000000000 THEN CONCAT(ROUND(total_sales_full_presence/1000000000, 1), 'B')
+        WHEN total_sales_full_presence >= 1000000 THEN CONCAT(ROUND(total_sales_full_presence/1000000, 1), 'M')
+        ELSE CONCAT(ROUND(total_sales_full_presence/1000, 1), 'K')
+    END as total_sales,
+    
+    -- Average sales per merchant
+    CASE 
+        WHEN avg_sales_per_full_presence_merchant >= 1000000 THEN CONCAT(ROUND(avg_sales_per_full_presence_merchant/1000000, 1), 'M')
+        WHEN avg_sales_per_full_presence_merchant >= 1000 THEN CONCAT(ROUND(avg_sales_per_full_presence_merchant/1000, 1), 'K')
+        ELSE CAST(ROUND(avg_sales_per_full_presence_merchant, 0) AS STRING)
+    END as avg_sales_per_merchant,
+    
+    -- Monthly averages
+    CASE 
+        WHEN avg_monthly_sales_per_merchant >= 1000000 THEN CONCAT(ROUND(avg_monthly_sales_per_merchant/1000000, 1), 'M')
+        WHEN avg_monthly_sales_per_merchant >= 1000 THEN CONCAT(ROUND(avg_monthly_sales_per_merchant/1000, 1), 'K')
+        ELSE CAST(ROUND(avg_monthly_sales_per_merchant, 0) AS STRING)
+    END as monthly_sales_per_merchant,
+    
+    FORMAT_NUMBER(ROUND(avg_monthly_txn_per_merchant, 0), 0) as monthly_txn_per_merchant,
+    ROUND(sales_per_txn_full_presence, 2) as sales_per_transaction
+
+FROM full_presence_metrics
+WHERE full_presence_merchant_count >= 10  -- Filter very small categories
+ORDER BY reference_month DESC, full_presence_merchant_count DESC
+""")
+
+full_presence_clean.createOrReplaceTempView("full_presence_clean")
+
+print("Full Presence Merchants (14-Month) - Clean Metrics:")
+full_presence_clean.show(25, truncate=False)
+
+# COMMAND ----------
+# View 6: Time Series Summary - Trend Analysis
+
+time_series_summary = spark.sql("""
+SELECT 
+    CONCAT(SUBSTR(CAST(reference_month AS STRING), 1, 4), '-', 
+           SUBSTR(CAST(reference_month AS STRING), 5, 2)) as ref_month,
+    
+    -- Overall totals across all NAICS
+    FORMAT_NUMBER(SUM(total_merchants), 0) as total_merchants_all,
+    FORMAT_NUMBER(SUM(full_presence_count), 0) as full_presence_all,
+    ROUND(AVG(pct_full_presence), 1) as avg_pct_full_presence,
+    
+    -- Sales totals
+    CASE 
+        WHEN SUM(total_sales_all_categories) >= 1000000000 THEN CONCAT(ROUND(SUM(total_sales_all_categories)/1000000000, 1), 'B')
+        WHEN SUM(total_sales_all_categories) >= 1000000 THEN CONCAT(ROUND(SUM(total_sales_all_categories)/1000000, 1), 'M')
+        ELSE CONCAT(ROUND(SUM(total_sales_all_categories)/1000, 1), 'K')
+    END as total_sales_all,
+    
+    -- Number of NAICS categories
+    COUNT(DISTINCT naics3) as naics_categories,
+    
+    -- Average sales per transaction across all
+    ROUND(AVG(avg_sales_per_transaction_overall), 2) as avg_sales_per_txn_all
+
+FROM reference_month_pivot_enhanced
+WHERE total_merchants >= 50
+GROUP BY reference_month
+ORDER BY reference_month DESC
+""")
+
+time_series_summary.createOrReplaceTempView("time_series_summary")
+
+print("Time Series Summary - Overall Trends:")
+time_series_summary.show(20, truncate=False)
+
+# COMMAND ----------
+print("""
+✅ Clean Dashboard Views Created!
+
+Easy-to-Read Views Available:
+1. clean_monthly_summary - High-level overview with formatted numbers
+2. presence_distribution - Merchant counts by presence category  
+3. top_naics_by_month - Top 5 industries by merchant count
+4. retention_analysis - Month-to-month retention with growth rates
+5. full_presence_clean - Detailed metrics for 14-month merchants
+6. time_series_summary - Overall trends across time
+
+All views feature:
+- ✅ Readable date formats (2020-02 instead of 202002)
+- ✅ Formatted numbers (1.5M instead of 1500000)
+- ✅ Percentage displays (85.3% instead of 85.3)
+- ✅ Filtered to significant categories only
+- ✅ Sorted by most recent first
+
+Use these views for dashboards and analysis!
+""")
+
+# COMMAND ----------
